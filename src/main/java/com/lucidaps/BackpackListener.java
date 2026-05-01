@@ -3,7 +3,9 @@ package com.lucidaps;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -17,23 +19,41 @@ public class BackpackListener implements Listener {
 
     @EventHandler
     public void onInventoryClose(InventoryCloseEvent event) {
-        // Retrieve the Backpack instance from the closed inventory
         Backpack backpack = Backpack.fromInventory(event.getInventory());
         if (backpack == null) {
-            return; // Not a backpack inventory
+            return;
         }
 
-        Player player = (Player) event.getPlayer();
+        if (!(event.getPlayer() instanceof Player player)) {
+            Backpack.unregisterInventory(event.getInventory());
+            return;
+        }
 
-        // Play the closing sound if enabled and configured
         if (plugin.areSoundsEnabled() && plugin.getCloseSound() != null) {
-            player.playSound(player.getLocation(), plugin.getCloseSound(), plugin.getSoundVolume(), plugin.getSoundPitch());
+            player.playSound(
+                    player.getLocation(),
+                    plugin.getCloseSound(),
+                    plugin.getSoundVolume(),
+                    plugin.getSoundPitch()
+            );
         }
 
-        // Determine if the player is the owner
+        boolean saved = backpack.handleClose(
+                player,
+                event.getInventory(),
+                plugin.isStorageHealthy()
+        );
+
+        Backpack.unregisterInventory(event.getInventory());
+
+        if (!saved) {
+            player.sendMessage("§cBackpack changes were not saved because server storage is unavailable.");
+            player.sendMessage("§cYour inventory was rolled back to prevent item duplication.");
+            return;
+        }
+
         boolean isOwner = backpack.getOwner().getUniqueId().equals(player.getUniqueId());
 
-        // Prepare placeholders
         Map<String, String> placeholders = new HashMap<>();
         if (!isOwner) {
             String ownerName = backpack.getOwner().getName();
@@ -41,13 +61,44 @@ public class BackpackListener implements Listener {
             placeholders.put("OwnerName", ownerName);
         }
 
-        // Determine the message path based on ownership
-        String messagePath = isOwner ? "Language.Ingame.OwnBackpackClose" : "Language.Ingame.PlayerBackpackClose";
+        String messagePath = isOwner
+                ? "Language.Ingame.OwnBackpackClose"
+                : "Language.Ingame.PlayerBackpackClose";
 
-        // Send the message using the utility method
         plugin.sendFormattedMessage(player, messagePath, placeholders);
+    }
 
-        // Unregister the inventory to clean up
-        Backpack.unregisterInventory(event.getInventory());
+    @EventHandler(ignoreCancelled = true)
+    public void onInventoryClick(InventoryClickEvent event) {
+        Backpack backpack = Backpack.fromInventory(event.getInventory());
+        if (backpack == null) return;
+
+        if (!(event.getWhoClicked() instanceof Player player)) {
+            event.setCancelled(true);
+            return;
+        }
+
+        if (!backpack.canEdit(player)) {
+            event.setCancelled(true);
+        } else {
+            backpack.setChanged();
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onInventoryDrag(InventoryDragEvent event) {
+        Backpack backpack = Backpack.fromInventory(event.getInventory());
+        if (backpack == null) return;
+
+        if (!(event.getWhoClicked() instanceof Player player)) {
+            event.setCancelled(true);
+            return;
+        }
+
+        if (!backpack.canEdit(player)) {
+            event.setCancelled(true);
+        } else {
+            backpack.setChanged();
+        }
     }
 }

@@ -23,10 +23,23 @@ public abstract class Database implements Listener {
 
 	public void close() {
 		HandlerList.unregisterAll(this);
+
+		boolean allSaved = true;
+
 		for (Backpack bp : backpacks.values()) {
-			bp.forceSave();
+			boolean saved = bp.forceSave();
+
+			if (!saved) {
+				allSaved = false;
+				plugin.getLogger().severe("Failed to save backpack for " + bp.getOwnerId() + " during shutdown!");
+			}
 		}
-		backpacks.clear();
+
+		if (allSaved) {
+			backpacks.clear();
+		} else {
+			plugin.getLogger().severe("Some backpacks were not saved. Keeping cache until plugin shutdown completes.");
+		}
 	}
 
 	/**
@@ -34,16 +47,30 @@ public abstract class Database implements Listener {
 	 */
 	public Backpack getBackpack(OfflinePlayer player) {
 		if (player == null) return null;
+
 		Backpack bp = backpacks.get(player.getUniqueId());
-		if (bp == null) {
-			bp = loadBackpack(player);
-			if (bp == null) {
-				// Create a new empty backpack if not found in DB
-				bp = new Backpack(player);
-				saveBackpack(bp);
-			}
-			backpacks.put(player.getUniqueId(), bp);
+		if (bp != null) {
+			return bp;
 		}
+
+		bp = loadBackpack(player);
+
+		if (bp == null) {
+			if (!plugin.isStorageHealthy()) {
+				plugin.getLogger().severe("Refusing to create empty backpack while storage is unhealthy: " + player.getUniqueId());
+				return null;
+			}
+
+			bp = new Backpack(player);
+
+			boolean saved = saveBackpack(bp);
+			if (!saved) {
+				plugin.getLogger().severe("Could not create new backpack safely: " + player.getUniqueId());
+				return null;
+			}
+		}
+
+		backpacks.put(player.getUniqueId(), bp);
 		return bp;
 	}
 
@@ -63,16 +90,20 @@ public abstract class Database implements Listener {
 	/**
 	 * Unloads a backpack from the cache and saves it if necessary.
 	 */
-	public void unloadBackpack(Backpack backpack) {
-		// If you want to force save on unload or ensure changes are saved:
-		backpack.save();
+	public boolean unloadBackpack(Backpack backpack) {
+		if (!backpack.save()) {
+			plugin.getLogger().severe("Refusing to unload backpack because save failed: " + backpack.getOwnerId());
+			return false;
+		}
+
 		backpacks.remove(backpack.getOwnerId());
+		return true;
 	}
 
 	/**
 	 * Save a backpack to the database.
 	 */
-	public abstract void saveBackpack(Backpack backpack);
+	public abstract boolean saveBackpack(Backpack backpack);
 
 	/**
 	 * Load a backpack from the database.

@@ -21,7 +21,15 @@ public class SQLite extends Database {
 	}
 
 	private Connection getConnection() throws SQLException {
-		return DriverManager.getConnection("jdbc:sqlite:" + dbFile);
+		Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
+
+		try (Statement stmt = conn.createStatement()) {
+			stmt.execute("PRAGMA busy_timeout = 5000;");
+			stmt.execute("PRAGMA foreign_keys = ON;");
+			stmt.execute("PRAGMA synchronous = FULL;");
+		}
+
+		return conn;
 	}
 
 	private void initDB() {
@@ -54,38 +62,117 @@ public class SQLite extends Database {
 	}
 
 	@Override
-	public void saveBackpack(Backpack backpack) {
+	public boolean saveBackpack(Backpack backpack) {
 		try (Connection conn = getConnection()) {
-			int playerId = backpack.getOwnerDatabaseId();
-			if (playerId <= 0) {
-				playerId = getPlayerId(conn, backpack.getOwner().getUniqueId());
+			conn.setAutoCommit(false);
+
+			try {
+				int playerId = backpack.getOwnerDatabaseId();
+
 				if (playerId <= 0) {
-					Player ownerPlayer = backpack.getOwnerPlayer();
-					if (ownerPlayer != null) updatePlayer(ownerPlayer);
-					playerId = getPlayerId(conn, backpack.getOwner().getUniqueId());
-					if (playerId <= 0) {
-						plugin.getLogger().warning("Could not get player ID for " + backpack.getOwner().getName() + "!");
-						return; // fallback if no player id
-					}
+					playerId = ensurePlayerId(conn, backpack.getOwner());
+					backpack.setOwnerDatabaseId(playerId);
 				}
-				backpack.setOwnerDatabaseId(playerId);
+
+				ItemStack[] contents = backpack.getInventory().getContents();
+				byte[] data = ItemStackArraySerializer.serializeItemStacks(contents);
+
+				try (PreparedStatement ps = conn.prepareStatement(
+						"""
+                        INSERT INTO backpacks (owner, itemstacks, version, lastupdate)
+                        VALUES (?, ?, 1, datetime('now'))
+                        ON CONFLICT(owner) DO UPDATE SET
+                            itemstacks = excluded.itemstacks,
+                            version = backpacks.version + 1,
+                            lastupdate = datetime('now')
+                        """
+				)) {
+					ps.setInt(1, playerId);
+					ps.setBytes(2, data);
+					ps.executeUpdate();
+				}
+
+				conn.commit();
+				return true;
+
+			} catch (SQLException | RuntimeException e) {
+				try {
+					conn.rollback();
+				} catch (SQLException rollbackException) {
+					plugin.getLogger().log(Level.SEVERE, "Failed to rollback backpack save!", rollbackException);
+				}
+
+				throw e;
 			}
 
-			// Serialize items
-			ItemStack[] contents = backpack.getInventory().getContents();
-			byte[] data = ItemStackArraySerializer.serializeItemStacks(contents);
-			int version = 1;
-
-			try (PreparedStatement ps = conn.prepareStatement("REPLACE INTO backpacks (owner, itemstacks, version, lastupdate) VALUES (?,?,?,DATE('now'))")) {
-				ps.setInt(1, playerId);
-				ps.setBytes(2, data);
-				ps.setInt(3, version);
-				ps.execute();
-			}
-
-		} catch (SQLException e) {
+		} catch (SQLException | RuntimeException e) {
 			plugin.getLogger().log(Level.SEVERE, "Failed to save backpack!", e);
+
+			if (isStorageFailure(e)) {
+				plugin.markStorageFailure(e);
+			}
+
+			return false;
 		}
+	}
+
+	private int ensurePlayerId(Connection conn, OfflinePlayer player) throws SQLException {
+		String uuidStr = player.getUniqueId().toString().replace("-", "");
+		String name = player.getName();
+
+		if (name == null || name.isBlank()) {
+			name = "Unknown";
+		}
+
+		try (PreparedStatement ps = conn.prepareStatement(
+				"INSERT OR IGNORE INTO backpack_players (name, uuid) VALUES (?, ?)"
+		)) {
+			ps.setString(1, name);
+			ps.setString(2, uuidStr);
+			ps.executeUpdate();
+		}
+
+		try (PreparedStatement ps = conn.prepareStatement(
+				"UPDATE backpack_players SET name = ? WHERE uuid = ?"
+		)) {
+			ps.setString(1, name);
+			ps.setString(2, uuidStr);
+			ps.executeUpdate();
+		}
+
+		int playerId = getPlayerId(conn, player.getUniqueId());
+
+		if (playerId <= 0) {
+			throw new SQLException("Could not create or find player ID for " + player.getUniqueId());
+		}
+
+		return playerId;
+	}
+
+	private boolean isStorageFailure(Throwable throwable) {
+		Throwable current = throwable;
+
+		while (current != null) {
+			String message = current.getMessage();
+
+			if (message != null) {
+				String lower = message.toLowerCase(java.util.Locale.ROOT);
+
+				if (
+						lower.contains("database or disk is full") ||
+								lower.contains("sqlite_full") ||
+								lower.contains("disk i/o error") ||
+								lower.contains("readonly database") ||
+								lower.contains("no space left on device")
+				) {
+					return true;
+				}
+			}
+
+			current = current.getCause();
+		}
+
+		return false;
 	}
 
 	@Override
@@ -105,8 +192,9 @@ public class SQLite extends Database {
 					}
 				}
 			}
-		} catch (SQLException e) {
+		} catch (SQLException | RuntimeException e) {
 			plugin.getLogger().log(Level.SEVERE, "Failed to load backpack!", e);
+			plugin.markStorageFailure(e);
 		}
 		return null;
 	}

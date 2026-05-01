@@ -9,6 +9,7 @@ import org.bukkit.OfflinePlayer;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.event.HandlerList;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -31,6 +32,7 @@ public class Minepacks extends JavaPlugin {
 	private CommandManager commandManager;
 	private Set<GameMode> allowedGameModes;
 	private String latestVersion = "";
+	private volatile boolean storageHealthy = true;
 
 	public static Minepacks getInstance() {
 		return instance;
@@ -113,6 +115,12 @@ public class Minepacks extends JavaPlugin {
 	}
 
 	public boolean isGameModeAllowed(Player player) {
+		// If the player has 'backpack.admin', always allow opening the backpack
+		if (player.hasPermission("backpack.admin")) {
+			return true;
+		}
+
+		// Otherwise, only allow if current GameMode is in the 'allowedGameModes' set
 		return allowedGameModes.contains(player.getGameMode());
 	}
 
@@ -192,84 +200,116 @@ public class Minepacks extends JavaPlugin {
 		return finalSize;
 	}
 
+	public boolean isStorageHealthy() {
+		return storageHealthy;
+	}
+
+	public void markStorageFailure(Throwable throwable) {
+		if (!storageHealthy) return;
+
+		storageHealthy = false;
+
+		getLogger().log(
+				java.util.logging.Level.SEVERE,
+				"Backpack storage failed. Backpacks are now locked to prevent duplication.",
+				throwable
+		);
+
+		getServer().getScheduler().runTask(this, () -> {
+			for (Player player : getServer().getOnlinePlayers()) {
+				if (Backpack.fromInventory(player.getOpenInventory().getTopInventory()) != null) {
+					player.closeInventory();
+					player.sendMessage(ChatColor.RED + "Backpacks were locked because the server could not save data.");
+				}
+			}
+		});
+	}
+
 	public void openBackpack(final Player opener, final OfflinePlayer owner, final boolean editable) {
-		// Check if the opener's game mode is allowed
+		openBackpack(opener, owner, editable, null);
+	}
+
+	public void openBackpack(Player opener, OfflinePlayer owner, boolean editable, String title) {
+		if (!isStorageHealthy()) {
+			opener.sendMessage(ChatColor.RED + "Backpacks are temporarily locked because the server cannot save data.");
+			return;
+		}
+
 		if (!isGameModeAllowed(opener)) {
-			String wrongGameModeMessage = getConfig().getString("Language.Ingame.Open.WrongGameMode",
-					"&cYou are not allowed to open your backpack in your current game mode.");
+			String wrongGameModeMessage = getConfig().getString(
+					"Language.Ingame.Open.WrongGameMode",
+					"&cYou are not allowed to open your backpack in your current game mode."
+			);
+
 			opener.sendMessage(ChatColor.translateAlternateColorCodes('&', wrongGameModeMessage));
 			return;
 		}
 
 		Backpack backpack = database.getBackpack(owner);
 
-		// If no backpack exists yet, create one
 		if (backpack == null) {
-			int size = 9;
-			if (owner.isOnline()) {
-				Player ownerPlayer = owner.getPlayer();
-				size = getBackpackPermSize(ownerPlayer);
-			}
+			opener.sendMessage(ChatColor.RED + "Backpack could not be loaded safely.");
+			return;
+		}
 
-			backpack = new Backpack(owner, size);
-			database.saveBackpack(backpack);
-		} else {
-			// If owner is online and permissions have changed, resize if necessary
-			if (owner.isOnline()) {
-				Player ownerPlayer = owner.getPlayer();
+		if (owner.isOnline()) {
+			Player ownerPlayer = owner.getPlayer();
+
+			if (ownerPlayer != null) {
 				int currentSize = backpack.getSize();
 				int newSize = getBackpackPermSize(ownerPlayer);
+
 				if (newSize > currentSize) {
-					backpack = resizeBackpack(backpack, newSize);
-					database.saveBackpack(backpack);
+					Backpack resized = resizeBackpack(backpack, newSize);
+
+					if (resized == null) {
+						opener.sendMessage(ChatColor.RED + "Backpack could not be resized safely.");
+						return;
+					}
+
+					backpack = resized;
 				}
 			}
 		}
-		openBackpack(opener, backpack, editable, null);
+
+		if (editable && backpack.hasOtherEditableViewer(opener)) {
+			opener.sendMessage(ChatColor.RED + "That backpack is already being edited.");
+			return;
+		}
+
+		openBackpack(opener, backpack, editable, title);
 	}
 
 	private Backpack resizeBackpack(Backpack oldBackpack, int newSize) {
 		OfflinePlayer owner = oldBackpack.getOwner();
 		Backpack newBackpack = new Backpack(owner, newSize, oldBackpack.getOwnerDatabaseId());
 
-		// Transfer items
-		org.bukkit.inventory.ItemStack[] oldContents = oldBackpack.getInventory().getContents();
-		newBackpack.getInventory().setContents(oldContents);
+		ItemStack[] oldContents = oldBackpack.getInventory().getContents();
+		ItemStack[] newContents = new ItemStack[newSize];
 
-		// Mark as changed and save immediately to sync database with the new inventory
+		for (int i = 0; i < Math.min(oldContents.length, newContents.length); i++) {
+			newContents[i] = oldContents[i] == null ? null : oldContents[i].clone();
+		}
+
+		newBackpack.getInventory().setContents(newContents);
 		newBackpack.setChanged();
-		Minepacks.getInstance().getDatabase().saveBackpack(newBackpack);
 
-		// Replace the old backpack in the cache with the new one
-		Minepacks.getInstance().getDatabase().replaceBackpack(owner, newBackpack);
+		boolean saved = newBackpack.save();
 
+		if (!saved) {
+			markStorageFailure(new IllegalStateException("Failed to save resized backpack."));
+			return null;
+		}
+
+		database.replaceBackpack(owner, newBackpack);
 		return newBackpack;
 	}
 
-	public void openBackpack(Player opener, OfflinePlayer owner, boolean editable, String title) {
-		// Check if the opener's game mode is allowed
-		if (!isGameModeAllowed(opener)) {
-			String wrongGameModeMessage = getConfig().getString("Language.Ingame.Open.WrongGameMode",
-					"&cYou are not allowed to open your backpack in your current game mode.");
-			opener.sendMessage(ChatColor.translateAlternateColorCodes('&', wrongGameModeMessage));
+	public void openBackpack(@NotNull final Player opener, @NotNull final Backpack backpack, boolean editable, @Nullable String title) {
+		if (!isStorageHealthy()) {
+			opener.sendMessage(ChatColor.RED + "Backpacks are temporarily locked because the server cannot save data.");
 			return;
 		}
-
-		Backpack backpack = database.getBackpack(owner);
-		if (backpack == null) {
-			int size = 9; // fallback
-			if (owner.isOnline()) {
-				Player ownerPlayer = owner.getPlayer();
-				size = getBackpackPermSize(ownerPlayer);
-			}
-
-			backpack = new Backpack(owner, size);
-			database.saveBackpack(backpack);
-		}
-		openBackpack(opener, backpack, editable, title);
-	}
-
-	public void openBackpack(@NotNull final Player opener, @NotNull final Backpack backpack, boolean editable, @Nullable String title) {
 		if (backpack == null) {
 			opener.sendMessage("Invalid backpack!");
 			return;
@@ -282,7 +322,14 @@ public class Minepacks extends JavaPlugin {
 
 	@Override
 	public void onDisable() {
-		if (database != null) database.close();
+		if (database != null) {
+			for (Backpack backpack : new java.util.ArrayList<>(database.getLoadedBackpacks())) {
+				backpack.closeAll();
+			}
+
+			database.close();
+		}
+
 		HandlerList.unregisterAll(this);
 		getServer().getScheduler().cancelTasks(this);
 		getLogger().info("Minepacks disabled.");

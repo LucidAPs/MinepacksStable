@@ -6,6 +6,7 @@ import org.bukkit.ChatColor;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -60,6 +61,30 @@ public class Backpack implements InventoryHolder {
 		bp = Bukkit.createInventory(this, size, title);
 	}
 
+	private final Map<UUID, OpenSnapshot> snapshots = new ConcurrentHashMap<>();
+
+	private static final class OpenSnapshot {
+		private final ItemStack[] backpackContents;
+		private final ItemStack[] storageContents;
+		private final ItemStack[] armorContents;
+		private final ItemStack offHand;
+		private final ItemStack cursorItem;
+
+		private OpenSnapshot(Player player, ItemStack[] backpackContents) {
+			this.backpackContents = cloneContents(backpackContents);
+			this.storageContents = cloneContents(player.getInventory().getStorageContents());
+			this.armorContents = cloneContents(player.getInventory().getArmorContents());
+
+			this.offHand = player.getInventory().getItemInOffHand() == null
+					? null
+					: player.getInventory().getItemInOffHand().clone();
+
+			this.cursorItem = player.getItemOnCursor() == null
+					? null
+					: player.getItemOnCursor().clone();
+		}
+	}
+
 	public Backpack(OfflinePlayer owner, @NotNull org.bukkit.inventory.ItemStack[] backpack, int ID) {
 		this(owner, backpack.length, ID);
 		bp.setContents(backpack);
@@ -74,42 +99,42 @@ public class Backpack implements InventoryHolder {
 	}
 
 	public void open(@NotNull Player player, boolean editable) {
-		opened.put(player, editable);
-		player.openInventory(bp);
-		// Register the inventory
-		inventoryBackpackMap.put(bp, this);
+		open(player, editable, null);
 	}
 
 	public void open(@NotNull Player player, boolean editable, @Nullable String title) {
 		opened.put(player, editable);
-		if (title != null && title.length() > 32) title = title.substring(0, 32);
+
+		if (editable) {
+			snapshots.put(player.getUniqueId(), new OpenSnapshot(player, bp.getContents()));
+		}
+
+		if (title != null && title.length() > 32) {
+			title = title.substring(0, 32);
+		}
+
 		if (title != null) {
-			// Translate color codes in the custom title
 			title = ChatColor.translateAlternateColorCodes('&', title);
+
 			Inventory inv = Bukkit.createInventory(this, bp.getSize(), title);
-			inv.setContents(bp.getContents());
-			player.openInventory(inv);
-			// Register the new inventory
+			inv.setContents(cloneContents(bp.getContents()));
+
 			inventoryBackpackMap.put(inv, this);
+			player.openInventory(inv);
 		} else {
-			player.openInventory(bp);
-			// Register the inventory
 			inventoryBackpackMap.put(bp, this);
+			player.openInventory(bp);
 		}
 	}
 
 	public void close(Player p) {
-		opened.remove(p);
-		// Optionally, close the inventory for the player
 		p.closeInventory();
 	}
 
 	public void closeAll() {
-		for (Player p : opened.keySet()) {
+		for (Player p : new ArrayList<>(opened.keySet())) {
 			p.closeInventory();
 		}
-		opened.clear();
-		save();
 	}
 
 	public boolean isOpen() {
@@ -133,22 +158,116 @@ public class Backpack implements InventoryHolder {
 		this.hasChanged = true;
 	}
 
-	public void save() {
-		if (hasChanged) {
-			Minepacks.getInstance().getDatabase().saveBackpack(this);
+	public boolean save() {
+		if (!hasChanged) {
+			return true;
+		}
+
+		boolean saved = Minepacks.getInstance().getDatabase().saveBackpack(this);
+
+		if (saved) {
 			hasChanged = false;
 		}
+
+		return saved;
 	}
 
-	public void forceSave() {
+	public boolean forceSave() {
 		hasChanged = true;
-		save();
+		return save();
 	}
 
-	public void clear() {
+	public boolean clear() {
+		ItemStack[] oldContents = cloneContents(bp.getContents());
+
 		bp.clear();
 		setChanged();
-		save();
+
+		if (!save()) {
+			bp.setContents(oldContents);
+			return false;
+		}
+
+		return true;
+	}
+
+	private static ItemStack[] cloneContents(ItemStack[] input) {
+		ItemStack[] copy = new ItemStack[input.length];
+
+		for (int i = 0; i < input.length; i++) {
+			copy[i] = input[i] == null ? null : input[i].clone();
+		}
+
+		return copy;
+	}
+
+	public boolean hasOtherEditableViewer(Player player) {
+		for (Map.Entry<Player, Boolean> entry : opened.entrySet()) {
+			if (Boolean.TRUE.equals(entry.getValue()) && !entry.getKey().equals(player)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	public boolean handleClose(Player player, Inventory closedInventory, boolean storageHealthy) {
+		Boolean editableValue = opened.remove(player);
+		boolean editable = Boolean.TRUE.equals(editableValue);
+
+		OpenSnapshot snapshot = snapshots.remove(player.getUniqueId());
+
+		if (!editable) {
+			return true;
+		}
+
+		if (!storageHealthy) {
+			rollback(player, snapshot);
+			return false;
+		}
+
+		ItemStack[] previousBackpackContents = cloneContents(bp.getContents());
+
+		bp.setContents(cloneContents(closedInventory.getContents()));
+		setChanged();
+
+		boolean saved = save();
+
+		if (saved) {
+			return true;
+		}
+
+		if (snapshot != null) {
+			rollback(player, snapshot);
+		} else {
+			bp.setContents(previousBackpackContents);
+		}
+
+		Minepacks.getInstance().markStorageFailure(
+				new IllegalStateException("Backpack save failed on inventory close.")
+		);
+
+		return false;
+	}
+
+	private void rollback(Player player, OpenSnapshot snapshot) {
+		if (snapshot == null) {
+			return;
+		}
+
+		bp.setContents(cloneContents(snapshot.backpackContents));
+
+		player.getInventory().setStorageContents(cloneContents(snapshot.storageContents));
+		player.getInventory().setArmorContents(cloneContents(snapshot.armorContents));
+		player.getInventory().setItemInOffHand(
+				snapshot.offHand == null ? null : snapshot.offHand.clone()
+		);
+
+		player.setItemOnCursor(
+				snapshot.cursorItem == null ? null : snapshot.cursorItem.clone()
+		);
+
+		player.updateInventory();
 	}
 
 	public UUID getOwnerId() {
@@ -169,6 +288,10 @@ public class Backpack implements InventoryHolder {
 
 	// Method to retrieve Backpack from Inventory
 	public static Backpack fromInventory(Inventory inventory) {
+		if (inventory.getHolder() instanceof Backpack backpack) {
+			return backpack;
+		}
+
 		return inventoryBackpackMap.get(inventory);
 	}
 

@@ -16,16 +16,26 @@ public class ItemStackArraySerializer {
     }
 
     public static ItemStack[] deserializeItemStacks(byte[] data) {
-        if (data == null || data.length == 0) return new ItemStack[9]; // Default empty inventory
+        if (data == null || data.length == 0) {
+            return new ItemStack[9];
+        }
 
         try {
             String text = new String(Base64.getDecoder().decode(data));
             YamlConfiguration config = new YamlConfiguration();
             config.loadFromString(text);
-            return ((List<ItemStack>) config.get("items", new ItemStack[0])).toArray(new ItemStack[0]);
+
+            Object raw = config.get("items");
+
+            if (!(raw instanceof List<?> list)) {
+                throw new IllegalStateException("Serialized backpack does not contain an item list.");
+            }
+
+            return list.toArray(new ItemStack[0]);
+
         } catch (Exception e) {
-            Minepacks.getInstance().getLogger().severe("Deserialization failed: " + e.getMessage());
-            return new ItemStack[9]; // Return empty inventory on failure
+            Minepacks.getInstance().getLogger().severe("Backpack deserialization failed: " + e.getMessage());
+            throw new IllegalStateException("Could not deserialize backpack items.", e);
         }
     }
 }
